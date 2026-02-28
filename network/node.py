@@ -4,6 +4,7 @@ import json
 import struct
 import threading
 import time
+import argparse
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple
 
@@ -31,9 +32,9 @@ load_dotenv()
 # =========================
 # Config
 # =========================
-MCAST_GRP = "239.255.42.99"
-MCAST_PORT = 6000
-TTL = 1
+MCAST_GRP = os.getenv("MCAST_GRP", "239.255.42.99")
+MCAST_PORT = int(os.getenv("MCAST_PORT", "6000"))
+TTL = int(os.getenv("MCAST_TTL", "1"))
 
 HELLO_INTERVAL = float(os.getenv("HELLO_INTERVAL", "30"))
 PEER_DEAD_AFTER = float(os.getenv("PEER_DEAD_AFTER", "90"))
@@ -45,12 +46,23 @@ TCP_PORT = int(os.getenv("TCP_PORT", "7777"))
 # (on finalise PEER_DB_PATH après avoir déterminé le port réel)
 PEER_DB_PATH_ENV = os.getenv("PEER_DB_PATH", "").strip()
 
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Archipel node (Sprint 1 mesh/discovery)")
+    parser.add_argument("--tcp-port", type=int, default=TCP_PORT, help="TCP listening port (default: 7777)")
+    parser.add_argument("--node-id-hex", type=str, default=os.getenv("NODE_ID_HEX", ""), help="Node ID as 64-hex chars")
+    parser.add_argument("--hello-interval", type=float, default=HELLO_INTERVAL, help="HELLO send interval in seconds")
+    parser.add_argument("--peer-dead-after", type=float, default=PEER_DEAD_AFTER, help="Peer timeout in seconds")
+    parser.add_argument("--peer-db-path", type=str, default=PEER_DB_PATH_ENV, help="Peer table persistence path")
+    parser.add_argument("--print-interval", type=float, default=5.0, help="Peer table print interval in seconds")
+    return parser.parse_args()
+
 # =========================
 # Node ID: bytes[32] (Ed25519 public key)
 # NODE_ID_HEX = 64 hex -> 32 bytes
 # =========================
-def get_node_id_bytes() -> bytes:
-    hx = os.getenv("NODE_ID_HEX", "").strip().lower()
+def get_node_id_bytes(node_id_hex: str = "") -> bytes:
+    hx = (node_id_hex or "").strip().lower()
     if not hx:
         b = os.urandom(32)
         print("[WARN] NODE_ID_HEX absent : génération d'un node_id aléatoire (dev only).")
@@ -207,6 +219,11 @@ class TCPServer:
         self.stop = stop
         self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                self._srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
 
     def start(self) -> int:
         self._srv.bind((self.bind_ip, self.port))
@@ -314,7 +331,8 @@ class TCPServer:
                                     self.peer_table.upsert(
                                         nid, ip, port,
                                         shared_files=list(shared_files) if isinstance(shared_files, list) else None,
-                                        reputation=float(reputation) if isinstance(reputation, (int, float)) else None
+                                        reputation=float(reputation) if isinstance(reputation, (int, float)) else None,
+                                        touch_last_seen=False,
                                     )
 
                             print(f"[TCP] PEER_LIST reçu de {addr[0]}:{addr[1]} -> table={len(self.peer_table.snapshot())} peers")
@@ -366,9 +384,21 @@ def send_peer_list_tcp(my_node_id: bytes, peer_table: PeerTable, to_ip: str, to_
     except Exception:
         return False
 
-def discovery_loop(my_node_id: bytes, my_tcp_port: int, peer_table: PeerTable, stop_event: threading.Event):
+def discovery_loop(
+    my_node_id: bytes,
+    my_tcp_port: int,
+    peer_table: PeerTable,
+    stop_event: threading.Event,
+    hello_interval: float,
+    peer_dead_after: float,
+):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_REUSEPORT"):
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        except OSError:
+            pass
     sock.bind(("", MCAST_PORT))
 
     mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton("0.0.0.0"))
@@ -381,7 +411,7 @@ def discovery_loop(my_node_id: bytes, my_tcp_port: int, peer_table: PeerTable, s
             sock.sendto(hello, (MCAST_GRP, MCAST_PORT))
             print(f"[{my_node_id.hex()[:8]}] HELLO envoyé (tcp={my_tcp_port})")
 
-            for _ in range(int(HELLO_INTERVAL * 10)):
+            for _ in range(max(1, int(hello_interval * 10))):
                 if stop_event.is_set():
                     break
                 time.sleep(0.1)
@@ -390,7 +420,7 @@ def discovery_loop(my_node_id: bytes, my_tcp_port: int, peer_table: PeerTable, s
 
     sock.settimeout(1.0)
     while not stop_event.is_set():
-        peer_table.cleanup(PEER_DEAD_AFTER)
+        peer_table.cleanup(peer_dead_after)
 
         try:
             data, (src_ip, _src_udp_port) = sock.recvfrom(65535)
@@ -457,18 +487,19 @@ def periodic_save(peer_table: PeerTable, stop: threading.Event, path: str, every
 # Main (le "nœud")
 # =========================
 if __name__ == "__main__":
-    my_node_id = get_node_id_bytes()
+    args = parse_args()
+    my_node_id = get_node_id_bytes(args.node_id_hex)
 
     stop = threading.Event()
 
     # TCP server
     peer_table = PeerTable(my_node_id=my_node_id)
-    tcp = TCPServer("0.0.0.0", TCP_PORT, peer_table, my_node_id, stop)
+    tcp = TCPServer("0.0.0.0", args.tcp_port, peer_table, my_node_id, stop)
     real_tcp_port = tcp.start()
 
     # ✅ fichier de persistance unique par instance (par port), sauf si override PEER_DB_PATH
-    if PEER_DB_PATH_ENV:
-        peer_db_path = PEER_DB_PATH_ENV
+    if args.peer_db_path:
+        peer_db_path = args.peer_db_path
     else:
         peer_db_path = f"peer_table_{real_tcp_port}.json"
 
@@ -476,10 +507,14 @@ if __name__ == "__main__":
     peer_table.load(peer_db_path)
 
     # Discovery
-    threading.Thread(target=discovery_loop, args=(my_node_id, real_tcp_port, peer_table, stop), daemon=True).start()
+    threading.Thread(
+        target=discovery_loop,
+        args=(my_node_id, real_tcp_port, peer_table, stop, args.hello_interval, args.peer_dead_after),
+        daemon=True,
+    ).start()
 
     # Logs + persistance
-    threading.Thread(target=periodic_print, args=(peer_table, stop), daemon=True).start()
+    threading.Thread(target=periodic_print, args=(peer_table, stop, args.print_interval), daemon=True).start()
     threading.Thread(target=periodic_save, args=(peer_table, stop, peer_db_path), daemon=True).start()
 
     try:

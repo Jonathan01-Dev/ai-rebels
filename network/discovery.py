@@ -1,186 +1,58 @@
-import socket
-import json
-import struct
-import threading
+"""Compatibility entrypoint for Sprint 1 discovery.
+
+This module intentionally delegates to network/node.py so the project has a
+single source of truth for:
+- UDP multicast HELLO discovery (239.255.42.99:6000)
+- TCP unicast PEER_LIST exchange (TLV)
+- peer table timeout/persistence
+"""
+
+from network.node import (
+    PeerTable,
+    TCPServer,
+    discovery_loop,
+    get_node_id_bytes,
+    parse_args,
+    periodic_print,
+    periodic_save,
+)
+
 import time
-from dataclasses import dataclass, asdict
-
-#Port 
-server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-server.bind(("0.0.0.0", 0))  # port auto
-server.listen()
-
-MY_TCP_PORT = server.getsockname()[1]
-
-print("TCP server running on port", MY_TCP_PORT)
+import threading
 
 
-##
-MCAST_GRP = "239.255.42.99"
-MCAST_PORT = 6000
-HELLO_INTERVAL = 30.0
-TTL = 1  # 1 = réseau local
-
-TYPE_HELLO = "HELLO"
-TYPE_PEER_LIST = "PEER_LIST"
-
-
-@dataclass
-class PeerInfo:
-    ip: str
-    port: int
-    last_seen: float
-
-
-class PeerTable:
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._peers = {}  # node_id -> PeerInfo
-
-    def upsert(self, node_id: str, ip: str, port: int):
-        now = time.time()
-        with self._lock:
-            self._peers[node_id] = PeerInfo(ip=ip, port=port, last_seen=now)
-
-    def snapshot(self):
-        with self._lock:
-            # retourne une copie sérialisable
-            return [
-                {"node_id": nid, "ip": p.ip, "port": p.port, "last_seen": p.last_seen}
-                for nid, p in self._peers.items()
-            ]
-
-    def cleanup(self, max_age_sec: float = 90.0):
-        """Optionnel : supprime les peers trop vieux."""
-        now = time.time()
-        with self._lock:
-            to_del = [nid for nid, p in self._peers.items() if now - p.last_seen > max_age_sec]
-            for nid in to_del:
-                del self._peers[nid]
-
-
-def build_packet(pkt_type: str, payload: dict) -> bytes:
-    pkt = {"type": pkt_type, **payload}
-    return json.dumps(pkt, separators=(",", ":")).encode("utf-8")
-
-
-def parse_packet(data: bytes) -> dict | None:
-    try:
-        return json.loads(data.decode("utf-8"))
-    except Exception:
-        return None
-
-
-def reply_with_peer_list(sock: socket.socket, peer_table: PeerTable, to_ip: str, to_port: int, my_node_id: str):
-    payload = {
-        "node_id": my_node_id,
-        "timestamp": int(time.time() * 1000),
-        "peers": peer_table.snapshot(),
-    }
-    pkt = build_packet(TYPE_PEER_LIST, payload)
-    sock.sendto(pkt, (to_ip, to_port))
-
-
-def discovery_loop(my_node_id: str, my_tcp_port: int, peer_table: PeerTable, stop_event: threading.Event):
-    # Socket UDP multicast
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-
-    # Permet à plusieurs processus d'écouter le même port sur la même machine (selon OS)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # Bind sur le port de découverte
-    sock.bind(("", MCAST_PORT))
-
-    # Rejoindre le groupe multicast
-    mreq = struct.pack("4s4s", socket.inet_aton(MCAST_GRP), socket.inet_aton("0.0.0.0"))
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-
-    # TTL multicast (réseau local)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, TTL)
-
-    # (Optionnel) Désactiver le loopback multicast (sinon tu peux recevoir tes propres HELLO)
-    # sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-
-    def send_hello_periodically():
-        while not stop_event.is_set():
-            hello = build_packet(TYPE_HELLO, {
-                "node_id": my_node_id,
-                "tcp_port": my_tcp_port,
-                "timestamp": int(time.time() * 1000),
-            })
-            sock.sendto(hello, (MCAST_GRP, MCAST_PORT))
-            
-            print(f"[{my_node_id}] HELLO envoyé (tcp={my_tcp_port})")
-            
-            # sleep en petites tranches pour réagir vite au stop_event
-            for _ in range(int(HELLO_INTERVAL * 10)):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.1)
-
-    sender_thread = threading.Thread(target=send_hello_periodically, daemon=True)
-    sender_thread.start()
-
-    # Boucle réception
-    sock.settimeout(1.0)
-    while not stop_event.is_set():
-        peer_table.cleanup()  # ou peer_table.cleanup(90.0)
-        try:
-            data, (src_ip, src_port) = sock.recvfrom(65535)
-        except socket.timeout:
-            peer_table.cleanup()
-            continue
-
-        pkt = parse_packet(data)
-        if not pkt or "type" not in pkt:
-            continue
-
-        # Ignore nos propres messages
-        if pkt.get("node_id") == my_node_id:
-            continue
-
-        if pkt["type"] == TYPE_HELLO:
-            node_id = pkt.get("node_id")
-            tcp_port = pkt.get("tcp_port")
-
-            if not node_id or not isinstance(tcp_port, int):
-                continue
-
-            # Ajoute/maj le peer
-            peer_table.upsert(node_id, src_ip, tcp_port)
-            print(f"[{my_node_id}] HELLO reçu de {node_id} ({src_ip}:{tcp_port})")
-            print(f"[{my_node_id}] peers = {peer_table.snapshot()}")
-
-            # Répond en unicast au port UDP source (src_port)
-            reply_with_peer_list(sock, peer_table, src_ip, src_port, my_node_id)
-
-        elif pkt["type"] == TYPE_PEER_LIST:
-            peers = pkt.get("peers")
-            if isinstance(peers, list):
-                for p in peers:
-                    nid = p.get("node_id")
-                    ip = p.get("ip")
-                    port = p.get("port")
-                    if nid and nid != my_node_id and isinstance(port, int) and isinstance(ip, str):
-                        peer_table.upsert(nid, ip, port)
-
-    try:
-        sock.close()
-    except Exception:
-        pass
-
-
-# Exemple d’utilisation
 if __name__ == "__main__":
-    my_node_id = "bf54e2b3f60599a04d477486b565f98d585c8580d41211382d9bbc982992e0af"
-    my_tcp_port = MY_TCP_PORT
-
-    peer_table = PeerTable()
-    
+    args = parse_args()
+    my_node_id = get_node_id_bytes(args.node_id_hex)
     stop = threading.Event()
 
+    peer_table = PeerTable(my_node_id=my_node_id)
+    tcp = TCPServer("0.0.0.0", args.tcp_port, peer_table, my_node_id, stop)
+    real_tcp_port = tcp.start()
+
+    if args.peer_db_path:
+        peer_db_path = args.peer_db_path
+    else:
+        peer_db_path = f"peer_table_{real_tcp_port}.json"
+
+    peer_table.load(peer_db_path)
+
+    threading.Thread(
+        target=discovery_loop,
+        args=(my_node_id, real_tcp_port, peer_table, stop, args.hello_interval, args.peer_dead_after),
+        daemon=True,
+    ).start()
+    threading.Thread(target=periodic_print, args=(peer_table, stop, args.print_interval), daemon=True).start()
+    threading.Thread(target=periodic_save, args=(peer_table, stop, peer_db_path), daemon=True).start()
+
     try:
-        discovery_loop(my_node_id, MY_TCP_PORT, peer_table, stop)
+        while True:
+            time.sleep(0.5)
     except KeyboardInterrupt:
         stop.set()
+        try:
+            peer_table.save(peer_db_path)
+        except Exception:
+            pass
+        tcp.close()
         print("\nStopping...")
