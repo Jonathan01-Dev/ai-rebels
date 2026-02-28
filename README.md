@@ -1,6 +1,12 @@
-                       ARCHIPEL 
-Protocole P2P Chiffré et Décentralisé à Zéro-Connexion 
 
+
+
+
+** Création de l'environnement virtuelle :
+python3 -m venv .venv
+
+** Activer le venv :
+source .venv/bin/activate
 
 ** Installer les dépendances:
 pip install -r requirements.txt
@@ -122,5 +128,40 @@ Flux C: transfert de fichier
 4. Le receveur vérifie chaque hash chunk, stocke, puis réassemble.
 5. Le hash final doit être identique au fichier source.
 
-**Test de communication **
-python .\network\node.py
+Limites du projet
+Le prototype actuel implémente uniquement la couche de base du réseau P2P (découverte et communication entre nœuds).
+Absence de chiffrement : les échanges entre nœuds ne sont pas sécurisés, les données circulent en clair sur le réseau.
+Fonctionnement limité au réseau local : la découverte des pairs repose sur le multicast UDP, ce qui ne fonctionne pas hors LAN.
+Pas de persistance avancée : la table des pairs est basique et ne gère pas encore pleinement la sauvegarde et la reprise.
+Gestion réseau simplifiée : absence de mécanismes de résilience (reconnexion automatique, gestion des erreurs, etc.).
+Aucune gestion de réputation ou de fichiers partagés : les champs prévus ne sont pas encore exploités.
+
+Pistes d’amélioration
+Chiffrement de bout en bout (E2E)
+Mise en place d’un échange de clés sécurisé (X25519) et chiffrement des communications avec AES-256-GCM.
+Authentification des nœuds
+Utilisation de clés Ed25519 pour garantir l’identité des pairs et éviter les attaques.
+Implémentation d’un handshake sécurisé
+Établissement d’une clé de session éphémère pour chaque connexion (forward secrecy).
+Système de confiance (Web of Trust)
+Vérification des pairs via un mécanisme de confiance sans autorité centrale (TOFU).
+Extension au-delà du réseau local
+Ajout de techniques comme le NAT traversal ou des relais pour permettre une communication sur Internet.
+Amélioration de la table de routage
+Gestion de la réputation des pairs, des fichiers partagés et de la persistance.
+
+Contributions
+Sophos: Justification dans le README
+Cléo: Génération des paires de clés RSA/Ed25519 
+Définition du format de paquet binaire 
+Schéba & leroi: Maquette de l'architecture en ACSII ou schéma dans le README 
+Push dans le README
+CODE:
+Cléo/leroi/Schéba: Node.py; Archiped_node.py;discorvery.py
+Cléo:gen_key.py; multicast_test.py
+TEST:Cléo/leroi/Schéba/Sophos
+
+
+
+
+
