@@ -1,12 +1,6 @@
+                       ARCHIPEL 
+Protocole P2P Chiffré et Décentralisé à Zéro-Connexion 
 
-
-
-
-** Création de l'environnement virtuelle :
-python3 -m venv .venv
-
-** Activer le venv :
-source .venv/bin/activate
 
 ** Installer les dépendances:
 pip install -r requirements.txt
@@ -127,3 +121,6 @@ Flux C: transfert de fichier
 3. Les chunks sont envoyés via `Transport` (TCP), protégés par `Crypto`.
 4. Le receveur vérifie chaque hash chunk, stocke, puis réassemble.
 5. Le hash final doit être identique au fichier source.
+
+**Test de communication **
+python .\network\node.py
